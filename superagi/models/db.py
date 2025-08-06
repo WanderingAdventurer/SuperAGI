@@ -1,3 +1,4 @@
+import os
 from sqlalchemy import create_engine
 from superagi.config.config import get_config
 from urllib.parse import urlparse
@@ -19,15 +20,15 @@ def connect_db():
         return engine
 
     # Create the connection URL
-    db_host = get_config('DB_HOST', 'super__postgres')
-    db_username = get_config('DB_USERNAME')
-    db_password = get_config('DB_PASSWORD')
-    db_name = get_config('DB_NAME')
-    db_url = get_config('DB_URL', None)
+    db_host = get_config('postgres.railway.internal', 'super__postgres')
+    db_username = get_config('postgres')
+    db_password = get_config('EsZzRjtvgnElBeXxIhMSVhvDampPthjJ')
+    db_name = get_config('railway')
+    db_url = get_config('postgresql://postgres:EsZzRjtvgnElBeXxIhMSVhvDampPthjJ@postgres.railway.internal:5432/railway', None)
 
     if db_url is None:
         if db_username is None:
-            DATABASE_URL = os.getenv("DATABASE_URL")
+            DATABASE_URL = os.getenv("postgresql://postgres:EsZzRjtvgnElBeXxIhMSVhvDampPthjJ@hopper.proxy.rlwy.net:21318/railway")
         else:
             db_url = f'postgresql://{db_username}:{db_password}@{db_host}/{db_name}'
     else:
