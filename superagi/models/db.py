@@ -42,8 +42,7 @@ def connect_db():
                            pool_recycle=1800,  # Recycle connections after this number of seconds (optional)
                            pool_pre_ping=False,  # Enable connection health checks (optional)
                            )
-
-      # Test connection
+        # Test connection
         connection = engine.connect()
         logger.info(f"Connected to the database! @ {db_url}")
         connection.close()
