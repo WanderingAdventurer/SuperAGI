@@ -43,11 +43,12 @@ def connect_db():
                            pool_pre_ping=False,  # Enable connection health checks (optional)
                            )
 
-    # Test the connection
-    try:
+      # Test connection
         connection = engine.connect()
-        logger.info("Connected to the database! @ " + db_url)
+        logger.info(f"Connected to the database! @ {db_url}")
         connection.close()
     except Exception as e:
-        logger.error(f"Unable to connect to the database:{e}")
+        logger.error(f"Unable to connect to the database: {e}")
+        raise e
+
     return engine
