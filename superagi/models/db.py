@@ -27,7 +27,7 @@ def connect_db():
 
     if db_url is None:
         if db_username is None:
-            db_url = f'postgresql://{db_host}/{db_name}'
+            DATABASE_URL = os.getenv("DATABASE_URL")'
         else:
             db_url = f'postgresql://{db_username}:{db_password}@{db_host}/{db_name}'
     else:
