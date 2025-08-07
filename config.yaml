@@ -1,4 +1,4 @@
-#####################------------------SYSTEM KEYS-------------------------########################
+ #####################------------------SYSTEM KEYS-------------------------########################
 PINECONE_API_KEY: YOUR_PINECONE_API_KEY
 PINECONE_ENVIRONMENT: YOUR_PINECONE_ENVIRONMENT
 
@@ -22,7 +22,7 @@ MAX_MODEL_TOKEN_LIMIT: 4032 # set to 2048 for llama
 #DATABASE INFO
 # redis details
 DB_NAME: super_agi_main
-DB_HOST: super__postgres
+DB_HOST: postgres.railway.internal
 DB_USERNAME: postgres
 DB_PASSWORD: EsZzRjtvgnElBeXxIhMSVhvDampPthjJ
 DB_URL: postgresql://superagi:EsZzRjtvgnElBeXxIhMSVhvDampPthjJ@super__postgres:5432/super_agi_main
