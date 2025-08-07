@@ -8,40 +8,38 @@ engine = None
 
 
 def connect_db():
-    """
-    Connects to the PostgreSQL database using SQLAlchemy.
-
-    Returns:
-        engine: The SQLAlchemy engine object representing the database connection.
-    """
-
     global engine
     if engine is not None:
         return engine
 
-    # Create the connection URL
-    db_host = get_configdb_host = get_config('DB_HOST', 'super__postgres')
-    db_username = get_config('DB_USERNAME')
-    db_password = get_config('DB_PASSWORD')
-    db_name = get_config('DB_NAME')
     db_url = get_config('DB_URL', None)
 
+    # Fallback logic if DB_URL not explicitly set
     if db_url is None:
-        if db_username is None:
-            DATABASE_URL = os.getenv("DATABASE_URL")
+        db_host = get_config('DB_HOST')
+        db_username = get_config('DB_USERNAME')
+        db_password = get_config('DB_PASSWORD')
+        db_name = get_config('DB_NAME')
+
+        # Fallback to environment if config returns None
+        if not all([db_host, db_username, db_password, db_name]):
+            db_url = os.getenv("DATABASE_URL")
+
         else:
-            db_url = f'postgresql://{db_username}:{db_password}@{db_host}/{db_name}'
-    else:
-        db_url = urlparse(db_url)
-        db_url = db_url.scheme + "://" + db_url.netloc + db_url.path
-    # Create the SQLAlchemy engine
-    engine = create_engine(db_url,
-                           pool_size=20,  # Maximum number of database connections in the pool
-                           max_overflow=50,  # Maximum number of connections that can be created beyond the pool_size
-                           pool_timeout=30,  # Timeout value in seconds for acquiring a connection from the pool
-                           pool_recycle=1800,  # Recycle connections after this number of seconds (optional)
-                           pool_pre_ping=False,  # Enable connection health checks (optional)
-                           )
+            db_url = f"postgresql://{db_username}:{db_password}@{db_host}/{db_name}"
+
+    if not db_url:
+        raise ValueError("DATABASE URL could not be determined. Check your environment variables or config.")
+
+    engine = create_engine(
+        db_url,
+        pool_size=20,
+        max_overflow=50,
+        pool_timeout=30,
+        pool_recycle=1800,
+        pool_pre_ping=False
+    )
+
     # Test the connection
     try:
         connection = engine.connect()
@@ -49,6 +47,5 @@ def connect_db():
         connection.close()
     except Exception as e:
         logger.error(f"Unable to connect to the database: {e}")
-        raise e
 
     return engine
