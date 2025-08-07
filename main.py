@@ -61,7 +61,7 @@ from superagi.models.workflows.iteration_workflow_step import IterationWorkflowS
 from urllib.parse import urlparse
 app = FastAPI()
 
-db_host = get_config('DB_HOST', 'super__postgres')
+db_host = get_config('DB_HOST')
 db_url = get_config('DB_URL', None)
 db_username = get_config('DB_USERNAME')
 db_password = get_config('DB_PASSWORD')
