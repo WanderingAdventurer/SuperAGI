@@ -1,8 +1,12 @@
+import os
+import subprocess
 import requests
+from datetime import timedelta
+from urllib.parse import urlparse
+
 from fastapi import FastAPI, HTTPException, Depends, Request, status, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi_jwt_auth import AuthJWT
 from fastapi_jwt_auth.exceptions import AuthJWTException
 from fastapi_sqlalchemy import DBSessionMiddleware, db
@@ -11,7 +15,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import superagi
-from datetime import timedelta, datetime
 from superagi.agent.workflow_seed import IterationWorkflowSeed, AgentWorkflowSeed
 from superagi.config.config import get_config
 from superagi.controllers.agent import router as agent_router
@@ -44,11 +47,8 @@ from superagi.controllers.api.agent import router as api_agent_router
 from superagi.controllers.webhook import router as web_hook_router
 from superagi.helper.tool_helper import register_toolkits, register_marketplace_toolkits
 from superagi.lib.logger import logger
-from superagi.llms.google_palm import GooglePalm
 from superagi.llms.llm_model_factory import build_model_with_api_key
 from superagi.llms.openai import OpenAi
-from superagi.llms.replicate import Replicate
-from superagi.llms.hugging_face import HuggingFace
 from superagi.models.agent_template import AgentTemplate
 from superagi.models.models_config import ModelsConfig
 from superagi.models.organisation import Organisation
@@ -57,9 +57,17 @@ from superagi.models.types.validate_llm_api_key_request import ValidateAPIKeyReq
 from superagi.models.user import User
 from superagi.models.workflows.agent_workflow import AgentWorkflow
 from superagi.models.workflows.iteration_workflow import IterationWorkflow
-from superagi.models.workflows.iteration_workflow_step import IterationWorkflowStep
-from urllib.parse import urlparse
-app = FastAPI()
+
+# ------------------- FastAPI App Config -------------------
+
+app = FastAPI(
+    title="SuperAGI",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json"
+)
+
+# ------------------- Database Setup -------------------
 
 db_host = get_config('DB_HOST')
 db_url = get_config('DB_URL')
@@ -78,21 +86,12 @@ else:
     db_url = db_url.scheme + "://" + db_url.netloc + db_url.path
 
 from superagi.models.db import connect_db
-from sqlalchemy.orm import sessionmaker
 
 engine = connect_db()
 Session = sessionmaker(bind=engine)
 session = Session()
 
-
-# app.add_middleware(DBSessionMiddleware, db_url=f'postgresql://{db_username}:{db_password}@localhost/{db_name}')
 app.add_middleware(DBSessionMiddleware, db_url=db_url)
-
-# Configure CORS middleware
-origins = [
-    # Add more origins if needed
-    "*",  # Allow all origins
-]
 
 app.add_middleware(
     CORSMiddleware,
@@ -101,74 +100,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Creating requrired tables -- Now handled using migrations
-# DBBaseModel.metadata.create_all(bind=engine, checkfirst=True)
-# DBBaseModel.metadata.drop_all(bind=engine,checkfirst=True)
+# ------------------- Run Alembic Migrations -------------------
 
+def run_migrations():
+    try:
+        logger.info("🔧 Running Alembic migrations...")
+        subprocess.run(
+            ["alembic", "upgrade", "head"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+    except subprocess.CalledProcessError as e:
+        logger.error("⚠️ Alembic migration failed:")
+        logger.error(e.stderr)
 
-app.include_router(user_router, prefix="/users")
-app.include_router(tool_router, prefix="/tools")
-app.include_router(organisation_router, prefix="/organisations")
-app.include_router(project_router, prefix="/projects")
-app.include_router(budget_router, prefix="/budgets")
-app.include_router(agent_router, prefix="/agents")
-app.include_router(agent_execution_router, prefix="/agentexecutions")
-app.include_router(agent_execution_feed_router, prefix="/agentexecutionfeeds")
-app.include_router(agent_execution_permission_router, prefix="/agentexecutionpermissions")
-app.include_router(resources_router, prefix="/resources")
-app.include_router(config_router, prefix="/configs")
-app.include_router(toolkit_router, prefix="/toolkits")
-app.include_router(tool_config_router, prefix="/tool_configs")
-app.include_router(config_router, prefix="/configs")
-app.include_router(agent_template_router, prefix="/agent_templates")
-app.include_router(agent_workflow_router, prefix="/agent_workflows")
-app.include_router(twitter_oauth_router, prefix="/twitter")
-app.include_router(agent_execution_config, prefix="/agent_executions_configs")
-app.include_router(analytics_router, prefix="/analytics")
-app.include_router(models_controller_router, prefix="/models_controller")
-app.include_router(google_oauth_router, prefix="/google")
-app.include_router(knowledges_router, prefix="/knowledges")
-app.include_router(knowledge_configs_router, prefix="/knowledge_configs")
-app.include_router(vector_dbs_router, prefix="/vector_dbs")
-app.include_router(vector_db_indices_router, prefix="/vector_db_indices")
-app.include_router(marketplace_stats_router, prefix="/marketplace")
-app.include_router(api_key_router, prefix="/api-keys")
-app.include_router(api_agent_router,prefix="/v1/agent")
-app.include_router(web_hook_router,prefix="/webhook")
-
-# in production you can use Settings management
-# from pydantic to get secret key from .env
-class Settings(BaseModel):
-    # jwt_secret = get_config("JWT_SECRET_KEY")
-    authjwt_secret_key: str = superagi.config.config.get_config("JWT_SECRET_KEY")
-
-
-def create_access_token(email, Authorize: AuthJWT = Depends()):
-    expiry_time_hours = superagi.config.config.get_config("JWT_EXPIRY")
-    if type(expiry_time_hours) == str:
-        expiry_time_hours = int(expiry_time_hours)
-    if expiry_time_hours is None:
-        expiry_time_hours = 200
-    expires = timedelta(hours=expiry_time_hours)
-    access_token = Authorize.create_access_token(subject=email, expires_time=expires)
-    return access_token
-
-
-# callback to get your configuration
-@AuthJWT.load_config
-def get_config():
-    return Settings()
-
-
-# exception handler for authjwt
-# in production, you can tweak performance using orjson response
-@app.exception_handler(AuthJWTException)
-def authjwt_exception_handler(request: Request, exc: AuthJWTException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.message}
-    )
-
+# ------------------- Startup Event -------------------
 
 def replace_old_iteration_workflows(session):
     templates = session.query(AgentTemplate).all()
@@ -176,39 +124,17 @@ def replace_old_iteration_workflows(session):
         iter_workflow = IterationWorkflow.find_by_id(session, template.agent_workflow_id)
         if not iter_workflow:
             continue
-        if iter_workflow.name == "Fixed Task Queue":
-            agent_workflow = AgentWorkflow.find_by_name(session, "Fixed Task Workflow")
+        name_map = {
+            "Fixed Task Queue": "Fixed Task Workflow",
+            "Maintain Task Queue": "Dynamic Task Workflow",
+            "Don't Maintain Task Queue": "Goal Based Workflow",
+            "Goal Based Agent": "Goal Based Workflow",
+        }
+        if iter_workflow.name in name_map:
+            agent_workflow = AgentWorkflow.find_by_name(session, name_map[iter_workflow.name])
             template.agent_workflow_id = agent_workflow.id
             session.commit()
 
-        if iter_workflow.name == "Maintain Task Queue":
-            agent_workflow = AgentWorkflow.find_by_name(session, "Dynamic Task Workflow")
-            template.agent_workflow_id = agent_workflow.id
-            session.commit()
-
-        if iter_workflow.name == "Don't Maintain Task Queue" or iter_workflow.name == "Goal Based Agent":
-            agent_workflow = AgentWorkflow.find_by_name(session, "Goal Based Workflow")
-            template.agent_workflow_id = agent_workflow.id
-            session.commit()
-import subprocess
-import os
-
-# Run Alembic migrations before app startup
-def run_migrations():
-    try:
-        print("🔧 Running Alembic migrations...")
-        result = subprocess.run(
-            ["alembic", "upgrade", "head"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        print(result.stdout)
-    except subprocess.CalledProcessError as e:
-        print("⚠️ Alembic migration failed:")
-        print(e.stderr)
-        
 @app.on_event("startup")
 async def startup_event():
     logger.info("Running Startup tasks")
@@ -223,29 +149,14 @@ async def startup_event():
             return False
 
     try:
+        run_migrations()
+
         if table_exists("users") and table_exists("organisations"):
             default_user = session.query(User).filter(User.email == "super6@agi.com").first()
-            logger.info(default_user)
-
-            if default_user is not None:
+            if default_user:
                 organisation = session.query(Organisation).filter_by(id=default_user.organisation_id).first()
-                logger.info(organisation)
-                register_toolkits(session, organisation)
-
-        def register_toolkit_for_all_organisation():
-            if table_exists("organisations"):
-                organizations = session.query(Organisation).all()
-                for organization in organizations:
-                    register_toolkits(session, organization)
-                logger.info("Successfully registered local toolkits for all Organisations!")
-
-        def register_toolkit_for_master_organisation():
-            if table_exists("organisations"):
-                marketplace_organisation_id = superagi.config.config.get_config("MARKETPLACE_ORGANISATION_ID")
-                marketplace_organisation = session.query(Organisation).filter(
-                    Organisation.id == marketplace_organisation_id).first()
-                if marketplace_organisation is not None:
-                    register_marketplace_toolkits(session, marketplace_organisation)
+                if organisation:
+                    register_toolkits(session, organisation)
 
         if table_exists("agent_workflows"):
             IterationWorkflowSeed.build_single_step_agent(session)
@@ -260,167 +171,138 @@ async def startup_event():
             AgentWorkflowSeed.build_recruitment_workflow(session)
             AgentWorkflowSeed.build_coding_workflow(session)
 
-            workflows = ["Sales Engagement Workflow", "Recruitment Workflow", "SuperCoder", "Goal Based Workflow",
-                         "Dynamic Task Workflow", "Fixed Task Workflow"]
-            workflows_to_remove = session.query(AgentWorkflow).filter(AgentWorkflow.name.not_in(workflows)).all()
+            allowed_workflows = [
+                "Sales Engagement Workflow", "Recruitment Workflow", "SuperCoder",
+                "Goal Based Workflow", "Dynamic Task Workflow", "Fixed Task Workflow"
+            ]
+            workflows_to_remove = session.query(AgentWorkflow).filter(
+                AgentWorkflow.name.not_in(allowed_workflows)).all()
             for workflow in workflows_to_remove:
                 session.delete(workflow)
 
             replace_old_iteration_workflows(session)
 
         if env != "PROD":
-            register_toolkit_for_all_organisation()
+            if table_exists("organisations"):
+                organizations = session.query(Organisation).all()
+                for org in organizations:
+                    register_toolkits(session, org)
         else:
-            register_toolkit_for_master_organisation()
+            marketplace_organisation_id = get_config("MARKETPLACE_ORGANISATION_ID")
+            if marketplace_organisation_id and table_exists("organisations"):
+                org = session.query(Organisation).filter_by(id=marketplace_organisation_id).first()
+                if org:
+                    register_marketplace_toolkits(session, org)
 
         session.commit()
 
     except Exception as e:
         logger.error(f"Startup event error: {e}")
-
     finally:
         session.close()
 
+# ------------------- Auth + Routes -------------------
 
-@app.post('/login')
+class Settings(BaseModel):
+    authjwt_secret_key: str = get_config("JWT_SECRET_KEY")
+
+
+@AuthJWT.load_config
+def get_config_jwt():
+    return Settings()
+
+
+@app.exception_handler(AuthJWTException)
+def authjwt_exception_handler(request: Request, exc: AuthJWTException):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+
+def create_access_token(email, Authorize: AuthJWT = Depends()):
+    expiry = int(get_config("JWT_EXPIRY", 200))
+    return Authorize.create_access_token(subject=email, expires_time=timedelta(hours=expiry))
+
+@app.post("/login")
 def login(request: LoginRequest, Authorize: AuthJWT = Depends()):
-    """Login API for email and password based login"""
-
-    email_to_find = request.email
-    user: User = db.session.query(User).filter(User.email == email_to_find).first()
-
-    if user == None or request.email != user.email or request.password != user.password:
+    user = db.session.query(User).filter(User.email == request.email).first()
+    if user is None or request.password != user.password:
         raise HTTPException(status_code=401, detail="Bad username or password")
+    return {"access_token": create_access_token(user.email, Authorize)}
 
-    # subject identifier for who this token is for example id or username from database
-    access_token = create_access_token(user.email, Authorize)
-    return {"access_token": access_token}
-
-
-# def get_jwt_from_payload(user_email: str,Authorize: AuthJWT = Depends()):
-#     access_token = Authorize.create_access_token(subject=user_email)
-#     return access_token
-
-@app.get('/github-login')
-def github_login():
-    """GitHub login"""
-
-    github_client_id = ""
-    return RedirectResponse(f'https://github.com/login/oauth/authorize?scope=user:email&client_id={github_client_id}')
-
-
-@app.get('/github-auth')
-def github_auth_handler(code: str = Query(...), Authorize: AuthJWT = Depends()):
-    """GitHub login callback"""
-
-    github_token_url = 'https://github.com/login/oauth/access_token'
-    github_client_id = superagi.config.config.get_config("GITHUB_CLIENT_ID")
-    github_client_secret = superagi.config.config.get_config("GITHUB_CLIENT_SECRET")
-
-    frontend_url = superagi.config.config.get_config("FRONTEND_URL", "http://localhost:3000")
-    params = {
-        'client_id': github_client_id,
-        'client_secret': github_client_secret,
-        'code': code
-    }
-    headers = {
-        'Accept': 'application/json'
-    }
-    response = requests.post(github_token_url, params=params, headers=headers)
-    if response.ok:
-        data = response.json()
-        access_token = data.get('access_token')
-        github_api_url = 'https://api.github.com/user'
-        headers = {
-            'Authorization': f'Bearer {access_token}'
-        }
-        response = requests.get(github_api_url, headers=headers)
-        if response.ok:
-            user_data = response.json()
-            user_email = user_data["email"]
-            if user_email is None:
-                user_email = user_data["login"] + "@github.com"
-            db_user: User = db.session.query(User).filter(User.email == user_email).first()
-            if db_user is not None:
-                jwt_token = create_access_token(user_email, Authorize)
-                redirect_url_success = f"{frontend_url}?access_token={jwt_token}&first_time_login={False}"
-                return RedirectResponse(url=redirect_url_success)
-
-            user = User(name=user_data["name"], email=user_email)
-            db.session.add(user)
-            db.session.commit()
-            jwt_token = create_access_token(user_email, Authorize)
-            redirect_url_success = f"{frontend_url}?access_token={jwt_token}&first_time_login={True}"
-            return RedirectResponse(url=redirect_url_success)
-        else:
-            redirect_url_failure = "https://superagi.com/"
-            return RedirectResponse(url=redirect_url_failure)
-    else:
-        redirect_url_failure = "https://superagi.com/"
-        return RedirectResponse(url=redirect_url_failure)
-
-
-@app.get('/user')
-def user(Authorize: AuthJWT = Depends()):
-    """API to get current logged in User"""
-
+@app.get("/user")
+def get_user(Authorize: AuthJWT = Depends()):
     Authorize.jwt_required()
-    current_user = Authorize.get_jwt_subject()
-    return {"user": current_user}
-
+    return {"user": Authorize.get_jwt_subject()}
 
 @app.get("/validate-access-token")
-async def root(Authorize: AuthJWT = Depends()):
-    """API to validate access token"""
-
+def validate_token(Authorize: AuthJWT = Depends()):
     try:
         Authorize.jwt_required()
-        current_user_email = Authorize.get_jwt_subject()
-        current_user = db.session.query(User).filter(User.email == current_user_email).first()
-        return current_user
+        user_email = Authorize.get_jwt_subject()
+        return db.session.query(User).filter(User.email == user_email).first()
     except:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
+        raise HTTPException(status_code=401, detail="Invalid token")
 
 @app.post("/validate-llm-api-key")
-async def validate_llm_api_key(request: ValidateAPIKeyRequest, Authorize: AuthJWT = Depends()):
-    """API to validate LLM API Key"""
-    source = request.model_source
-    api_key = request.model_api_key
-    model = build_model_with_api_key(source, api_key)
-    valid_api_key = model.verify_access_key() if model is not None else False
-    if valid_api_key:
+def validate_llm_api_key(request: ValidateAPIKeyRequest):
+    model = build_model_with_api_key(request.model_source, request.model_api_key)
+    if model and model.verify_access_key():
         return {"message": "Valid API Key", "status": "success"}
-    else:
-        return {"message": "Invalid API Key", "status": "failed"}
-
+    return {"message": "Invalid API Key", "status": "failed"}
 
 @app.get("/validate-open-ai-key/{open_ai_key}")
-async def root(open_ai_key: str, Authorize: AuthJWT = Depends()):
-    """API to validate Open AI Key"""
-
+def validate_openai(open_ai_key: str):
     try:
-        llm = OpenAi(api_key=open_ai_key)
-        response = llm.chat_completion([{"role": "system", "content": "Hey!"}])
+        OpenAi(api_key=open_ai_key).chat_completion([{"role": "system", "content": "Hey!"}])
+        return {"message": "Valid key"}
     except:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API Key")
+        raise HTTPException(status_code=401, detail="Invalid API Key")
 
+# ------------------- Utility Routes -------------------
 
-# #Unprotected route
+@app.get("/")
+def root():
+    return {"message": "SuperAGI backend is running!"}
+
+@app.get("/ping")
+def ping():
+    return {"message": "pong"}
+
 @app.get("/hello/{name}")
-async def say_hello(name: str, Authorize: AuthJWT = Depends()):
+def hello(name: str, Authorize: AuthJWT = Depends()):
     Authorize.jwt_required()
     return {"message": f"Hello {name}"}
 
 @app.get('/get/github_client_id')
 def github_client_id():
-    """Get GitHub Client ID"""
+    return {"github_client_id": get_config("GITHUB_CLIENT_ID", "").strip()}
 
-    git_hub_client_id = superagi.config.config.get_config("GITHUB_CLIENT_ID")
-    if git_hub_client_id:
-        git_hub_client_id = git_hub_client_id.strip()
-    return {"github_client_id": git_hub_client_id}
+# ------------------- Include API Routers -------------------
 
-# # __________________TO RUN____________________________
-# # uvicorn main:app --host 0.0.0.0 --port 8001 --reload
-
+app.include_router(user_router, prefix="/users")
+app.include_router(tool_router, prefix="/tools")
+app.include_router(organisation_router, prefix="/organisations")
+app.include_router(project_router, prefix="/projects")
+app.include_router(budget_router, prefix="/budgets")
+app.include_router(agent_router, prefix="/agents")
+app.include_router(agent_execution_router, prefix="/agentexecutions")
+app.include_router(agent_execution_feed_router, prefix="/agentexecutionfeeds")
+app.include_router(agent_execution_permission_router, prefix="/agentexecutionpermissions")
+app.include_router(resources_router, prefix="/resources")
+app.include_router(config_router, prefix="/configs")
+app.include_router(toolkit_router, prefix="/toolkits")
+app.include_router(tool_config_router, prefix="/tool_configs")
+app.include_router(agent_template_router, prefix="/agent_templates")
+app.include_router(agent_workflow_router, prefix="/agent_workflows")
+app.include_router(twitter_oauth_router, prefix="/twitter")
+app.include_router(agent_execution_config, prefix="/agent_executions_configs")
+app.include_router(analytics_router, prefix="/analytics")
+app.include_router(models_controller_router, prefix="/models_controller")
+app.include_router(google_oauth_router, prefix="/google")
+app.include_router(knowledges_router, prefix="/knowledges")
+app.include_router(knowledge_configs_router, prefix="/knowledge_configs")
+app.include_router(vector_dbs_router, prefix="/vector_dbs")
+app.include_router(vector_db_indices_router, prefix="/vector_db_indices")
+app.include_router(marketplace_stats_router, prefix="/marketplace")
+app.include_router(api_key_router, prefix="/api-keys")
+app.include_router(api_agent_router, prefix="/v1/agent")
+app.include_router(web_hook_router, prefix="/webhook")
