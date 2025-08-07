@@ -190,7 +190,25 @@ def replace_old_iteration_workflows(session):
             agent_workflow = AgentWorkflow.find_by_name(session, "Goal Based Workflow")
             template.agent_workflow_id = agent_workflow.id
             session.commit()
+import subprocess
+import os
 
+# Run Alembic migrations before app startup
+def run_migrations():
+    try:
+        print("🔧 Running Alembic migrations...")
+        result = subprocess.run(
+            ["alembic", "upgrade", "head"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        print(result.stdout)
+    except subprocess.CalledProcessError as e:
+        print("⚠️ Alembic migration failed:")
+        print(e.stderr)
+        
 @app.on_event("startup")
 async def startup_event():
     # Perform startup tasks here
