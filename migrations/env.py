@@ -28,7 +28,7 @@ from superagi.config.config import get_config
 # my_important_option = config.get_main_option("my_important_option")
 # ... etc.
 
-db_host = get_config('DB_HOST', 'super__postgres')
+db_host = get_config('DB_HOST')
 db_username = get_config('DB_USERNAME')
 db_password = get_config('DB_PASSWORD')
 db_name = get_config('DB_NAME')
