@@ -20,11 +20,11 @@ def connect_db():
         return engine
 
     # Create the connection URL
-    db_host = get_config('postgres.railway.internal', 'super__postgres')
-    db_username = get_config('postgres')
-    db_password = get_config('EsZzRjtvgnElBeXxIhMSVhvDampPthjJ')
-    db_name = get_config('railway')
-    db_url = get_config('postgresql://postgres:EsZzRjtvgnElBeXxIhMSVhvDampPthjJ@postgres.railway.internal:5432/railway', None)
+    db_host = get_configdb_host = get_config('DB_HOST', 'super__postgres')
+    db_username = get_config('DB_USERNAME')
+    db_password = get_config('DB_PASSWORD')
+    db_name = get_config('DB_NAME')
+    db_url = get_config('DB_URL', None)
 
     if db_url is None:
         if db_username is None:
