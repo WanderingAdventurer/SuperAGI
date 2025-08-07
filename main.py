@@ -245,4 +245,61 @@ def github_client_id():
 # ------------------- Include API Routers -------------------
 
 from superagi.controllers import (
-    agent as agent_ro_
+    agent as agent_router,
+    agent_execution as agent_execution_router,
+    agent_execution_feed as agent_execution_feed_router,
+    agent_execution_permission as agent_execution_permission_router,
+    agent_template as agent_template_router,
+    agent_workflow as agent_workflow_router,
+    budget as budget_router,
+    config as config_router,
+    organisation as organisation_router,
+    project as project_router,
+    twitter_oauth as twitter_oauth_router,
+    google_oauth as google_oauth_router,
+    resources as resources_router,
+    tool as tool_router,
+    tool_config as tool_config_router,
+    toolkit as toolkit_router,
+    user as user_router,
+    agent_execution_config as agent_execution_config,
+    analytics as analytics_router,
+    models_controller as models_controller_router,
+    knowledges as knowledges_router,
+    knowledge_configs as knowledge_configs_router,
+    vector_dbs as vector_dbs_router,
+    vector_db_indices as vector_db_indices_router,
+    marketplace_stats as marketplace_stats_router,
+    api_key as api_key_router,
+    api as api_agent_router,
+    webhook as web_hook_router
+)
+
+app.include_router(user_router, prefix="/users")
+app.include_router(tool_router, prefix="/tools")
+app.include_router(organisation_router, prefix="/organisations")
+app.include_router(project_router, prefix="/projects")
+app.include_router(budget_router, prefix="/budgets")
+app.include_router(agent_router, prefix="/agents")
+app.include_router(agent_execution_router, prefix="/agentexecutions")
+app.include_router(agent_execution_feed_router, prefix="/agentexecutionfeeds")
+app.include_router(agent_execution_permission_router, prefix="/agentexecutionpermissions")
+app.include_router(resources_router, prefix="/resources")
+app.include_router(config_router, prefix="/configs")
+app.include_router(toolkit_router, prefix="/toolkits")
+app.include_router(tool_config_router, prefix="/tool_configs")
+app.include_router(agent_template_router, prefix="/agent_templates")
+app.include_router(agent_workflow_router, prefix="/agent_workflows")
+app.include_router(twitter_oauth_router, prefix="/twitter")
+app.include_router(agent_execution_config, prefix="/agent_executions_configs")
+app.include_router(analytics_router, prefix="/analytics")
+app.include_router(models_controller_router, prefix="/models_controller")
+app.include_router(google_oauth_router, prefix="/google")
+app.include_router(knowledges_router, prefix="/knowledges")
+app.include_router(knowledge_configs_router, prefix="/knowledge_configs")
+app.include_router(vector_dbs_router, prefix="/vector_dbs")
+app.include_router(vector_db_indices_router, prefix="/vector_db_indices")
+app.include_router(marketplace_stats_router, prefix="/marketplace")
+app.include_router(api_key_router, prefix="/api-keys")
+app.include_router(api_agent_router.router, prefix="/v1/agent")  # note .router for APIRouter inside module
+app.include_router(web_hook_router, prefix="/webhook")
