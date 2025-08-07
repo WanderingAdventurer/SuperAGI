@@ -1,5 +1,10 @@
-# ... all your original imports remain unchanged
-from fastapi import FastAPI, HTTPException, Depends, Request, status, Query
+import os
+import subprocess
+import requests
+from datetime import timedelta
+from urllib.parse import urlparse
+
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi_jwt_auth import AuthJWT
@@ -7,21 +12,59 @@ from fastapi_jwt_auth.exceptions import AuthJWTException
 from fastapi_sqlalchemy import DBSessionMiddleware, db
 from pydantic import BaseModel
 from sqlalchemy.orm import sessionmaker
-from urllib.parse import urlparse
 
-# ------------------- FastAPI App Config -------------------
+from superagi.agent.workflow_seed import IterationWorkflowSeed, AgentWorkflowSeed
+from superagi.config.config import get_config
+from superagi.controllers.agent import router as agent_router
+from superagi.controllers.agent_execution import router as agent_execution_router
+from superagi.controllers.agent_execution_feed import router as agent_execution_feed_router
+from superagi.controllers.agent_execution_permission import router as agent_execution_permission_router
+from superagi.controllers.agent_template import router as agent_template_router
+from superagi.controllers.agent_workflow import router as agent_workflow_router
+from superagi.controllers.budget import router as budget_router
+from superagi.controllers.config import router as config_router
+from superagi.controllers.organisation import router as organisation_router
+from superagi.controllers.project import router as project_router
+from superagi.controllers.twitter_oauth import router as twitter_oauth_router
+from superagi.controllers.google_oauth import router as google_oauth_router
+from superagi.controllers.resources import router as resources_router
+from superagi.controllers.tool import router as tool_router
+from superagi.controllers.tool_config import router as tool_config_router
+from superagi.controllers.toolkit import router as toolkit_router
+from superagi.controllers.user import router as user_router
+from superagi.controllers.agent_execution_config import router as agent_execution_config
+from superagi.controllers.analytics import router as analytics_router
+from superagi.controllers.models_controller import router as models_controller_router
+from superagi.controllers.knowledges import router as knowledges_router
+from superagi.controllers.knowledge_configs import router as knowledge_configs_router
+from superagi.controllers.vector_dbs import router as vector_dbs_router
+from superagi.controllers.vector_db_indices import router as vector_db_indices_router
+from superagi.controllers.marketplace_stats import router as marketplace_stats_router
+from superagi.controllers.api_key import router as api_key_router
+from superagi.controllers.api.agent import router as api_agent_router
+from superagi.controllers.webhook import router as web_hook_router
+from superagi.helper.tool_helper import register_toolkits, register_marketplace_toolkits
+from superagi.lib.logger import logger
+from superagi.llms.llm_model_factory import build_model_with_api_key
+from superagi.llms.openai import OpenAi
+from superagi.models.agent_template import AgentTemplate
+from superagi.models.models_config import ModelsConfig
+from superagi.models.organisation import Organisation
+from superagi.models.types.login_request import LoginRequest
+from superagi.models.types.validate_llm_api_key_request import ValidateAPIKeyRequest
+from superagi.models.user import User
+from superagi.models.workflows.agent_workflow import AgentWorkflow
+from superagi.models.workflows.iteration_workflow import IterationWorkflow
+from superagi.models.db import connect_db
 
 app = FastAPI(
     title="SuperAGI",
-    docs_url="/docs",         # ✅ ensures Swagger UI is accessible
-    redoc_url="/redoc",       # ✅ optional Redoc UI
+    docs_url="/docs",
+    redoc_url="/redoc",
     openapi_url="/openapi.json"
 )
 
-# ------------------- Middleware & DB Setup -------------------
-
-from superagi.config.config import get_config
-from superagi.models.db import connect_db
+# ------------------- Database Setup -------------------
 
 db_host = get_config('DB_HOST')
 db_url = get_config('DB_URL')
@@ -44,7 +87,6 @@ Session = sessionmaker(bind=engine)
 session = Session()
 
 app.add_middleware(DBSessionMiddleware, db_url=db_url)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,14 +94,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------- Alembic Migrations -------------------
-
-import subprocess
-from superagi.lib.logger import logger
+# ------------------- Run Alembic Migrations -------------------
 
 def run_migrations():
     try:
-        logger.info("🔧 Running Alembic migrations...")
+        logger.info("\ud83d\udd27 Running Alembic migrations...")
         subprocess.run(
             ["alembic", "upgrade", "head"],
             check=True,
@@ -68,19 +107,10 @@ def run_migrations():
             text=True
         )
     except subprocess.CalledProcessError as e:
-        logger.error("⚠️ Alembic migration failed:")
+        logger.error("\u26a0\ufe0f Alembic migration failed:")
         logger.error(e.stderr)
 
-# ------------------- Startup Tasks -------------------
-
-from superagi.models.organisation import Organisation
-from superagi.models.user import User
-from superagi.models.models_config import ModelsConfig
-from superagi.models.agent_template import AgentTemplate
-from superagi.models.workflows.agent_workflow import AgentWorkflow
-from superagi.models.workflows.iteration_workflow import IterationWorkflow
-from superagi.agent.workflow_seed import AgentWorkflowSeed, IterationWorkflowSeed
-from superagi.helper.tool_helper import register_toolkits, register_marketplace_toolkits
+# ------------------- Startup Event -------------------
 
 def replace_old_iteration_workflows(session):
     templates = session.query(AgentTemplate).all()
@@ -102,7 +132,6 @@ def replace_old_iteration_workflows(session):
 @app.on_event("startup")
 async def startup_event():
     logger.info("Running Startup tasks")
-    Session = sessionmaker(bind=engine)
     session = Session()
 
     def table_exists(table_name: str) -> bool:
@@ -165,7 +194,7 @@ async def startup_event():
     finally:
         session.close()
 
-# ------------------- Auth & JWT -------------------
+# ------------------- Auth + Routes -------------------
 
 class Settings(BaseModel):
     authjwt_secret_key: str = get_config("JWT_SECRET_KEY")
@@ -177,11 +206,6 @@ def get_config_jwt():
 @app.exception_handler(AuthJWTException)
 def authjwt_exception_handler(request: Request, exc: AuthJWTException):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
-
-from superagi.models.types.login_request import LoginRequest
-from superagi.models.types.validate_llm_api_key_request import ValidateAPIKeyRequest
-from superagi.llms.llm_model_factory import build_model_with_api_key
-from superagi.llms.openai import OpenAi
 
 def create_access_token(email, Authorize: AuthJWT = Depends()):
     expiry = int(get_config("JWT_EXPIRY", 200))
@@ -223,7 +247,7 @@ def validate_openai(open_ai_key: str):
     except:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
-# ------------------- Basic Utility Routes -------------------
+# ------------------- Utility Routes -------------------
 
 @app.get("/")
 def root():
@@ -242,38 +266,7 @@ def hello(name: str, Authorize: AuthJWT = Depends()):
 def github_client_id():
     return {"github_client_id": get_config("GITHUB_CLIENT_ID", "").strip()}
 
-# ------------------- Include API Routers -------------------
-
-from superagi.controllers import (
-    agent as agent_router,
-    agent_execution as agent_execution_router,
-    agent_execution_feed as agent_execution_feed_router,
-    agent_execution_permission as agent_execution_permission_router,
-    agent_template as agent_template_router,
-    agent_workflow as agent_workflow_router,
-    budget as budget_router,
-    config as config_router,
-    organisation as organisation_router,
-    project as project_router,
-    twitter_oauth as twitter_oauth_router,
-    google_oauth as google_oauth_router,
-    resources as resources_router,
-    tool as tool_router,
-    tool_config as tool_config_router,
-    toolkit as toolkit_router,
-    user as user_router,
-    agent_execution_config as agent_execution_config,
-    analytics as analytics_router,
-    models_controller as models_controller_router,
-    knowledges as knowledges_router,
-    knowledge_configs as knowledge_configs_router,
-    vector_dbs as vector_dbs_router,
-    vector_db_indices as vector_db_indices_router,
-    marketplace_stats as marketplace_stats_router,
-    api_key as api_key_router,
-    api as api_agent_router,
-    webhook as web_hook_router
-)
+# ------------------- Include Routers -------------------
 
 app.include_router(user_router, prefix="/users")
 app.include_router(tool_router, prefix="/tools")
@@ -301,5 +294,5 @@ app.include_router(vector_dbs_router, prefix="/vector_dbs")
 app.include_router(vector_db_indices_router, prefix="/vector_db_indices")
 app.include_router(marketplace_stats_router, prefix="/marketplace")
 app.include_router(api_key_router, prefix="/api-keys")
-app.include_router(api_agent_router.router, prefix="/v1/agent")  # note .router for APIRouter inside module
+app.include_router(api_agent_router, prefix="/v1/agent")
 app.include_router(web_hook_router, prefix="/webhook")
