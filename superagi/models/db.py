@@ -28,7 +28,7 @@ def connect_db():
 
     if db_url is None:
         if db_username is None:
-            DATABASE_URL = os.getenv("postgresql://postgres:EsZzRjtvgnElBeXxIhMSVhvDampPthjJ@hopper.proxy.rlwy.net:21318/railway")
+            DATABASE_URL = os.getenv("DATABASE_URL")
         else:
             db_url = f'postgresql://{db_username}:{db_password}@{db_host}/{db_name}'
     else:
