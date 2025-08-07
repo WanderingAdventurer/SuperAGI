@@ -296,3 +296,8 @@ app.include_router(marketplace_stats_router, prefix="/marketplace")
 app.include_router(api_key_router, prefix="/api-keys")
 app.include_router(api_agent_router, prefix="/v1/agent")
 app.include_router(web_hook_router, prefix="/webhook")
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
