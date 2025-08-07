@@ -211,58 +211,75 @@ def run_migrations():
         
 @app.on_event("startup")
 async def startup_event():
-    # Perform startup tasks here
     logger.info("Running Startup tasks")
     Session = sessionmaker(bind=engine)
     session = Session()
-    default_user = session.query(User).filter(User.email == "super6@agi.com").first()
-    logger.info(default_user)
-    if default_user is not None:
-        organisation = session.query(Organisation).filter_by(id=default_user.organisation_id).first()
-        logger.info(organisation)
-        register_toolkits(session, organisation)
 
-    def register_toolkit_for_all_organisation():
-        organizations = session.query(Organisation).all()
-        for organization in organizations:
-            register_toolkits(session, organization)
-        logger.info("Successfully registered local toolkits for all Organisations!")
+    def table_exists(table_name: str) -> bool:
+        try:
+            return engine.dialect.has_table(engine.connect(), table_name)
+        except Exception as e:
+            logger.error(f"Error checking table '{table_name}': {e}")
+            return False
 
-    def register_toolkit_for_master_organisation():
-        marketplace_organisation_id = superagi.config.config.get_config("MARKETPLACE_ORGANISATION_ID")
-        marketplace_organisation = session.query(Organisation).filter(
-            Organisation.id == marketplace_organisation_id).first()
-        if marketplace_organisation is not None:
-            register_marketplace_toolkits(session, marketplace_organisation)
+    try:
+        if table_exists("users") and table_exists("organisations"):
+            default_user = session.query(User).filter(User.email == "super6@agi.com").first()
+            logger.info(default_user)
 
-    IterationWorkflowSeed.build_single_step_agent(session)
-    IterationWorkflowSeed.build_task_based_agents(session)
-    IterationWorkflowSeed.build_action_based_agents(session)
-    IterationWorkflowSeed.build_initialize_task_workflow(session)
+            if default_user is not None:
+                organisation = session.query(Organisation).filter_by(id=default_user.organisation_id).first()
+                logger.info(organisation)
+                register_toolkits(session, organisation)
 
-    AgentWorkflowSeed.build_goal_based_agent(session)
-    AgentWorkflowSeed.build_task_based_agent(session)
-    AgentWorkflowSeed.build_fixed_task_based_agent(session)
-    AgentWorkflowSeed.build_sales_workflow(session)
-    AgentWorkflowSeed.build_recruitment_workflow(session)
-    AgentWorkflowSeed.build_coding_workflow(session)
+        def register_toolkit_for_all_organisation():
+            if table_exists("organisations"):
+                organizations = session.query(Organisation).all()
+                for organization in organizations:
+                    register_toolkits(session, organization)
+                logger.info("Successfully registered local toolkits for all Organisations!")
 
-    # NOTE: remove old workflows. Need to remove this changes later
-    workflows = ["Sales Engagement Workflow", "Recruitment Workflow", "SuperCoder", "Goal Based Workflow",
-     "Dynamic Task Workflow", "Fixed Task Workflow"]
-    workflows = session.query(AgentWorkflow).filter(AgentWorkflow.name.not_in(workflows))
-    for workflow in workflows:
-        session.delete(workflow)
+        def register_toolkit_for_master_organisation():
+            if table_exists("organisations"):
+                marketplace_organisation_id = superagi.config.config.get_config("MARKETPLACE_ORGANISATION_ID")
+                marketplace_organisation = session.query(Organisation).filter(
+                    Organisation.id == marketplace_organisation_id).first()
+                if marketplace_organisation is not None:
+                    register_marketplace_toolkits(session, marketplace_organisation)
 
-    # AgentWorkflowSeed.doc_search_and_code(session)
-    # AgentWorkflowSeed.build_research_email_workflow(session)
-    replace_old_iteration_workflows(session)
+        if table_exists("agent_workflows"):
+            IterationWorkflowSeed.build_single_step_agent(session)
+            IterationWorkflowSeed.build_task_based_agents(session)
+            IterationWorkflowSeed.build_action_based_agents(session)
+            IterationWorkflowSeed.build_initialize_task_workflow(session)
 
-    if env != "PROD":
-        register_toolkit_for_all_organisation()
-    else:
-        register_toolkit_for_master_organisation()
-    session.close()
+            AgentWorkflowSeed.build_goal_based_agent(session)
+            AgentWorkflowSeed.build_task_based_agent(session)
+            AgentWorkflowSeed.build_fixed_task_based_agent(session)
+            AgentWorkflowSeed.build_sales_workflow(session)
+            AgentWorkflowSeed.build_recruitment_workflow(session)
+            AgentWorkflowSeed.build_coding_workflow(session)
+
+            workflows = ["Sales Engagement Workflow", "Recruitment Workflow", "SuperCoder", "Goal Based Workflow",
+                         "Dynamic Task Workflow", "Fixed Task Workflow"]
+            workflows_to_remove = session.query(AgentWorkflow).filter(AgentWorkflow.name.not_in(workflows)).all()
+            for workflow in workflows_to_remove:
+                session.delete(workflow)
+
+            replace_old_iteration_workflows(session)
+
+        if env != "PROD":
+            register_toolkit_for_all_organisation()
+        else:
+            register_toolkit_for_master_organisation()
+
+        session.commit()
+
+    except Exception as e:
+        logger.error(f"Startup event error: {e}")
+
+    finally:
+        session.close()
 
 
 @app.post('/login')
