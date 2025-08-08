@@ -63,12 +63,11 @@ app = FastAPI(
     title="SuperAGI",
     docs_url="/docs",
     redoc_url="/redoc",
-    openapi_url="/openapi.json"
+    openapi_url="/openapi.json",
 )
 
-# ------------------- Database & Middleware -------------------
+# ------------------- Database URL for middleware -------------------
 
-# Pull config; keep db_url for middleware
 db_host = get_config('DB_HOST')
 db_url = get_config('DB_URL')
 db_username = get_config('DB_USERNAME')
@@ -83,18 +82,16 @@ if db_url is None:
         db_url = f'postgresql://{db_username}:{db_password}@{db_host}/{db_name}'
 else:
     parsed = urlparse(db_url)
-    db_url = parsed.scheme + "://" + parsed.netloc + parsed.path
+    db_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
-# Create engine via project helper
+# Create engine via our helper (also logs connectivity)
 engine = connect_db()
-Session = sessionmaker(bind=engine)
 
-# IMPORTANT: SQLAlchemy hides passwords when str(engine.url) is used.
-# Use render_as_string(hide_password=False) so the middleware can connect.
-resolved_db_url = engine.url.render_as_string(hide_password=False)
-app.add_middleware(DBSessionMiddleware, db_url=resolved_db_url)
+# FastAPI-SQLAlchemy middleware needs a DB URL string
+app.add_middleware(DBSessionMiddleware, db_url=db_url)
 
-# CORS
+# ------------------- CORS -------------------
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -102,7 +99,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------- Alembic Migrations -------------------
+# ------------------- Alembic migrations -------------------
 
 def run_migrations():
     try:
@@ -112,29 +109,28 @@ def run_migrations():
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
         )
     except subprocess.CalledProcessError as e:
         logger.error("⚠️ Alembic migration failed:")
         logger.error(e.stderr)
 
-# ------------------- Startup Seeding -------------------
+# ------------------- Startup tasks -------------------
 
 def replace_old_iteration_workflows(session):
     templates = session.query(AgentTemplate).all()
-    name_map = {
-        "Fixed Task Queue": "Fixed Task Workflow",
-        "Maintain Task Queue": "Dynamic Task Workflow",
-        "Don't Maintain Task Queue": "Goal Based Workflow",
-        "Goal Based Agent": "Goal Based Workflow",
-    }
     for template in templates:
-        iter_wf = IterationWorkflow.find_by_id(session, template.agent_workflow_id)
-        if not iter_wf:
+        iter_workflow = IterationWorkflow.find_by_id(session, template.agent_workflow_id)
+        if not iter_workflow:
             continue
-        new_name = name_map.get(iter_wf.name)
-        if new_name:
-            agent_workflow = AgentWorkflow.find_by_name(session, new_name)
+        name_map = {
+            "Fixed Task Queue": "Fixed Task Workflow",
+            "Maintain Task Queue": "Dynamic Task Workflow",
+            "Don't Maintain Task Queue": "Goal Based Workflow",
+            "Goal Based Agent": "Goal Based Workflow",
+        }
+        if iter_workflow.name in name_map:
+            agent_workflow = AgentWorkflow.find_by_name(session, name_map[iter_workflow.name])
             if agent_workflow:
                 template.agent_workflow_id = agent_workflow.id
                 session.commit()
@@ -142,22 +138,19 @@ def replace_old_iteration_workflows(session):
 @app.on_event("startup")
 async def startup_event():
     logger.info("Running Startup tasks")
-    session = Session()
+    SessionLocal = sessionmaker(bind=engine)
+    session = SessionLocal()
 
     def table_exists(table_name: str) -> bool:
         try:
-            # Use SQLAlchemy dialect helper to check
-            with engine.connect() as conn:
-                return engine.dialect.has_table(conn, table_name)
+            return engine.dialect.has_table(engine.connect(), table_name)
         except Exception as e:
             logger.error(f"Error checking table '{table_name}': {e}")
             return False
 
     try:
-        # Run migrations first so tables exist
         run_migrations()
 
-        # Register toolkits for an existing default user (optional)
         if table_exists("users") and table_exists("organisations"):
             default_user = session.query(User).filter(User.email == "super6@agi.com").first()
             if default_user:
@@ -165,7 +158,6 @@ async def startup_event():
                 if organisation:
                     register_toolkits(session, organisation)
 
-        # Seed workflows if table exists
         if table_exists("agent_workflows"):
             IterationWorkflowSeed.build_single_step_agent(session)
             IterationWorkflowSeed.build_task_based_agents(session)
@@ -179,43 +171,39 @@ async def startup_event():
             AgentWorkflowSeed.build_recruitment_workflow(session)
             AgentWorkflowSeed.build_coding_workflow(session)
 
-            # Clean up unknown workflows
-            allowed = {
+            allowed = [
                 "Sales Engagement Workflow", "Recruitment Workflow", "SuperCoder",
-                "Goal Based Workflow", "Dynamic Task Workflow", "Fixed Task Workflow"
-            }
-            workflows_to_remove = session.query(AgentWorkflow).filter(
-                AgentWorkflow.name.not_in(list(allowed))
-            ).all()
-            for wf in workflows_to_remove:
-                session.delete(wf)
+                "Goal Based Workflow", "Dynamic Task Workflow", "Fixed Task Workflow",
+            ]
+            extra = session.query(AgentWorkflow).filter(AgentWorkflow.name.not_in(allowed)).all()
+            for w in extra:
+                session.delete(w)
 
             replace_old_iteration_workflows(session)
 
-        # Toolkit registration strategy
         if env != "PROD":
             if table_exists("organisations"):
-                organizations = session.query(Organisation).all()
-                for org in organizations:
+                for org in session.query(Organisation).all():
                     register_toolkits(session, org)
         else:
-            if table_exists("organisations"):
-                marketplace_org_id = get_config("MARKETPLACE_ORGANISATION_ID")
-                if marketplace_org_id:
-                    org = session.query(Organisation).filter_by(id=marketplace_org_id).first()
-                    if org:
-                        register_marketplace_toolkits(session, org)
+            marketplace_org_id = get_config("MARKETPLACE_ORGANISATION_ID")
+            if marketplace_org_id and table_exists("organisations"):
+                org = session.query(Organisation).filter_by(id=marketplace_org_id).first()
+                if org:
+                    register_marketplace_toolkits(session, org)
 
         session.commit()
+
     except Exception as e:
         logger.error(f"Startup event error: {e}")
+
     finally:
         session.close()
 
-# ------------------- Auth & Small APIs -------------------
+# ------------------- JWT / Auth -------------------
 
 class Settings(BaseModel):
-    authjwt_secret_key: str = get_config("JWT_SECRET_KEY")
+    authjwt_secret_key: str = get_config("JWT_SECRET_KEY") or "CHANGE_ME_LOCAL_ONLY"
 
 @AuthJWT.load_config
 def get_config_jwt():
@@ -226,15 +214,49 @@ def authjwt_exception_handler(request: Request, exc: AuthJWTException):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
 def create_access_token(email, Authorize: AuthJWT = Depends()):
-    expiry = int(get_config("JWT_EXPIRY", 200))
-    return Authorize.create_access_token(subject=email, expires_time=timedelta(hours=expiry))
+    expiry_raw = get_config("JWT_EXPIRY", 200)
+    try:
+        expiry_hours = int(expiry_raw) if expiry_raw is not None else 200
+    except Exception:
+        expiry_hours = 200
+    return Authorize.create_access_token(subject=email, expires_time=timedelta(hours=expiry_hours))
+
+# ------------------- Routes: Auth / Utility -------------------
 
 @app.post("/login")
 def login(request: LoginRequest, Authorize: AuthJWT = Depends()):
-    user = db.session.query(User).filter(User.email == request.email).first()
-    if user is None or request.password != user.password:
-        raise HTTPException(status_code=401, detail="Bad username or password")
-    return {"access_token": create_access_token(user.email, Authorize)}
+    """
+    Email/password login -> returns JWT access token
+    """
+    try:
+        logger.info(f"🔐 /login called for email={request.email!r}")
+
+        jwt_secret = get_config("JWT_SECRET_KEY")
+        if not jwt_secret or not isinstance(jwt_secret, str) or not jwt_secret.strip():
+            logger.error("❌ JWT_SECRET_KEY is missing/blank in environment.")
+            raise HTTPException(status_code=500, detail="Server JWT misconfiguration. Set JWT_SECRET_KEY and redeploy.")
+
+        user = db.session.query(User).filter(User.email == request.email).first()
+        if user is None:
+            logger.warning("❌ /login: user not found")
+            raise HTTPException(status_code=401, detail="Bad username or password")
+
+        if request.password != user.password:
+            logger.warning("❌ /login: bad password")
+            raise HTTPException(status_code=401, detail="Bad username or password")
+
+        token = create_access_token(user.email, Authorize)
+        logger.info("✅ /login: token issued")
+        return {"access_token": token}
+
+    except AuthJWTException as e:
+        logger.exception(f"JWT error during /login: {e}")
+        raise HTTPException(status_code=500, detail="JWT subsystem error. Check JWT_SECRET_KEY.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"💥 /login crashed: {e}")
+        raise HTTPException(status_code=500, detail="Login crashed; check server logs.")
 
 @app.get("/user")
 def get_user(Authorize: AuthJWT = Depends()):
@@ -247,7 +269,7 @@ def validate_token(Authorize: AuthJWT = Depends()):
         Authorize.jwt_required()
         user_email = Authorize.get_jwt_subject()
         return db.session.query(User).filter(User.email == user_email).first()
-    except:
+    except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 @app.post("/validate-llm-api-key")
@@ -262,10 +284,8 @@ def validate_openai(open_ai_key: str):
     try:
         OpenAi(api_key=open_ai_key).chat_completion([{"role": "system", "content": "Hey!"}])
         return {"message": "Valid key"}
-    except:
+    except Exception:
         raise HTTPException(status_code=401, detail="Invalid API Key")
-
-# ------------------- Utility & Health -------------------
 
 @app.get("/")
 def root():
@@ -284,7 +304,49 @@ def hello(name: str, Authorize: AuthJWT = Depends()):
 def github_client_id():
     return {"github_client_id": (get_config("GITHUB_CLIENT_ID") or "").strip()}
 
-# ------------------- Routers -------------------
+# ------------------- OAuth (unchanged) -------------------
+
+@app.get('/github-login')
+def github_login():
+    github_client_id = ""
+    return RedirectResponse(f'https://github.com/login/oauth/authorize?scope=user:email&client_id={github_client_id}')
+
+@app.get('/github-auth')
+def github_auth_handler(code: str = Query(...), Authorize: AuthJWT = Depends()):
+    github_token_url = 'https://github.com/login/oauth/access_token'
+    github_client_id = get_config("GITHUB_CLIENT_ID")
+    github_client_secret = get_config("GITHUB_CLIENT_SECRET")
+    frontend_url = get_config("FRONTEND_URL", "http://localhost:3000")
+
+    params = {'client_id': github_client_id, 'client_secret': github_client_secret, 'code': code}
+    headers = {'Accept': 'application/json'}
+    response = requests.post(github_token_url, params=params, headers=headers)
+    if not response.ok:
+        return RedirectResponse(url="https://superagi.com/")
+
+    data = response.json()
+    access_token = data.get('access_token')
+    github_api_url = 'https://api.github.com/user'
+    headers = {'Authorization': f'Bearer {access_token}'}
+    response = requests.get(github_api_url, headers=headers)
+    if not response.ok:
+        return RedirectResponse(url="https://superagi.com/")
+
+    user_data = response.json()
+    user_email = user_data.get("email") or f"{user_data.get('login', 'user')}@github.com"
+    db_user: User = db.session.query(User).filter(User.email == user_email).first()
+    first_time = False
+    if db_user is None:
+        first_time = True
+        db_user = User(name=user_data.get("name") or "GitHub User", email=user_email)
+        db.session.add(db_user)
+        db.session.commit()
+
+    jwt_token = create_access_token(user_email, Authorize)
+    redirect_url_success = f"{frontend_url}?access_token={jwt_token}&first_time_login={str(first_time).lower()}"
+    return RedirectResponse(url=redirect_url_success)
+
+# ------------------- Include API Routers -------------------
 
 app.include_router(user_router, prefix="/users")
 app.include_router(tool_router, prefix="/tools")
