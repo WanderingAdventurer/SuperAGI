@@ -1,3 +1,4 @@
+# main.py
 import os
 import subprocess
 from datetime import timedelta
@@ -13,9 +14,24 @@ from fastapi_sqlalchemy import DBSessionMiddleware, db
 from pydantic import BaseModel
 from sqlalchemy.orm import sessionmaker
 
+# --- SuperAGI imports
 import superagi
+from superagi.config.config import get_config as sa_get_config
+from superagi.lib.logger import logger
+from superagi.models.db import connect_db
+from superagi.models.user import User
+from superagi.models.organisation import Organisation
+from superagi.models.agent_template import AgentTemplate
+from superagi.models.workflows.agent_workflow import AgentWorkflow
+from superagi.models.workflows.iteration_workflow import IterationWorkflow
+from superagi.models.types.login_request import LoginRequest
+from superagi.models.types.validate_llm_api_key_request import ValidateAPIKeyRequest
+from superagi.llms.llm_model_factory import build_model_with_api_key
+from superagi.llms.openai import OpenAi
 from superagi.agent.workflow_seed import IterationWorkflowSeed, AgentWorkflowSeed
-from superagi.config.config import get_config
+from superagi.helper.tool_helper import register_toolkits, register_marketplace_toolkits
+
+# --- Routers
 from superagi.controllers.agent import router as agent_router
 from superagi.controllers.agent_execution import router as agent_execution_router
 from superagi.controllers.agent_execution_feed import router as agent_execution_feed_router
@@ -44,21 +60,10 @@ from superagi.controllers.marketplace_stats import router as marketplace_stats_r
 from superagi.controllers.api_key import router as api_key_router
 from superagi.controllers.api.agent import router as api_agent_router
 from superagi.controllers.webhook import router as web_hook_router
-from superagi.helper.tool_helper import register_toolkits, register_marketplace_toolkits
-from superagi.lib.logger import logger
-from superagi.llms.llm_model_factory import build_model_with_api_key
-from superagi.llms.openai import OpenAi
-from superagi.models.agent_template import AgentTemplate
-from superagi.models.organisation import Organisation
-from superagi.models.types.login_request import LoginRequest
-from superagi.models.types.validate_llm_api_key_request import ValidateAPIKeyRequest
-from superagi.models.user import User
-from superagi.models.workflows.agent_workflow import AgentWorkflow
-from superagi.models.workflows.iteration_workflow import IterationWorkflow
-from superagi.models.db import connect_db
 
-# ------------------- FastAPI App -------------------
-
+# =============================================================================
+# App
+# =============================================================================
 app = FastAPI(
     title="SuperAGI",
     docs_url="/docs",
@@ -66,32 +71,45 @@ app = FastAPI(
     openapi_url="/openapi.json",
 )
 
-# ------------------- Database URL for middleware -------------------
+# Helpers to read config: prefer env, fallback to SuperAGI config
+def cfg(key: str, default=None):
+    return os.getenv(key) or sa_get_config(key, default)
 
-db_host = get_config('DB_HOST')
-db_url = get_config('DB_URL')
-db_username = get_config('DB_USERNAME')
-db_password = get_config('DB_PASSWORD')
-db_name = get_config('DB_NAME')
-env = get_config('ENV', "DEV")
+# =============================================================================
+# DB setup
+# =============================================================================
+def build_db_url() -> str:
+    raw_url = cfg("DB_URL")
+    if raw_url:
+        # Normalize possible DSN into SQLAlchemy format
+        parsed = urlparse(raw_url)
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
-if db_url is None:
-    if db_username is None:
-        db_url = f'postgresql://{db_host}/{db_name}'
+    host = cfg("DB_HOST")
+    user = cfg("DB_USERNAME")
+    pwd = cfg("DB_PASSWORD")
+    name = cfg("DB_NAME")
+
+    # Fallbacks for Railway typical env (only if not provided)
+    if not host:
+        host = "postgres.railway.internal"
+    if not name:
+        name = "railway"
+
+    if user and pwd:
+        return f"postgresql://{user}:{pwd}@{host}/{name}"
     else:
-        db_url = f'postgresql://{db_username}:{db_password}@{db_host}/{db_name}'
-else:
-    parsed = urlparse(db_url)
-    db_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        # passwordless/local
+        return f"postgresql://{host}/{name}"
 
-# Create engine via our helper (also logs connectivity)
-engine = connect_db()
+db_url = build_db_url()
+engine = connect_db()  # uses SuperAGI's internal logic (already adjusted in your repo)
+SessionLocal = sessionmaker(bind=engine)
 
-# FastAPI-SQLAlchemy middleware needs a DB URL string
+# FastAPI-SQLAlchemy middleware needs a URL string
 app.add_middleware(DBSessionMiddleware, db_url=db_url)
 
-# ------------------- CORS -------------------
-
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -99,8 +117,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------- Alembic migrations -------------------
+# =============================================================================
+# JWT / Auth
+# =============================================================================
+JWT_SECRET = cfg("JWT_SECRET_KEY")
+if not JWT_SECRET:
+    logger.error("❌ JWT_SECRET_KEY not found in environment or config.")
+else:
+    logger.info("✅ JWT_SECRET_KEY detected from environment/config.")
 
+class Settings(BaseModel):
+    authjwt_secret_key: str = JWT_SECRET or "MISSING"
+
+@AuthJWT.load_config
+def get_auth_settings():
+    return Settings()
+
+@app.exception_handler(AuthJWTException)
+def authjwt_exception_handler(request: Request, exc: AuthJWTException):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+def create_access_token(email: str, Authorize: AuthJWT) -> str:
+    expiry_hours = int(cfg("JWT_EXPIRY", 200))
+    return Authorize.create_access_token(subject=email, expires_time=timedelta(hours=expiry_hours))
+
+# =============================================================================
+# Migrations
+# =============================================================================
 def run_migrations():
     try:
         logger.info("🔧 Running Alembic migrations...")
@@ -115,148 +158,105 @@ def run_migrations():
         logger.error("⚠️ Alembic migration failed:")
         logger.error(e.stderr)
 
-# ------------------- Startup tasks -------------------
-
+# =============================================================================
+# Startup tasks
+# =============================================================================
 def replace_old_iteration_workflows(session):
     templates = session.query(AgentTemplate).all()
+    name_map = {
+        "Fixed Task Queue": "Fixed Task Workflow",
+        "Maintain Task Queue": "Dynamic Task Workflow",
+        "Don't Maintain Task Queue": "Goal Based Workflow",
+        "Goal Based Agent": "Goal Based Workflow",
+    }
     for template in templates:
-        iter_workflow = IterationWorkflow.find_by_id(session, template.agent_workflow_id)
-        if not iter_workflow:
+        iter_flow = IterationWorkflow.find_by_id(session, template.agent_workflow_id)
+        if not iter_flow:
             continue
-        name_map = {
-            "Fixed Task Queue": "Fixed Task Workflow",
-            "Maintain Task Queue": "Dynamic Task Workflow",
-            "Don't Maintain Task Queue": "Goal Based Workflow",
-            "Goal Based Agent": "Goal Based Workflow",
-        }
-        if iter_workflow.name in name_map:
-            agent_workflow = AgentWorkflow.find_by_name(session, name_map[iter_workflow.name])
-            if agent_workflow:
-                template.agent_workflow_id = agent_workflow.id
+        if iter_flow.name in name_map:
+            wf = AgentWorkflow.find_by_name(session, name_map[iter_flow.name])
+            if wf:
+                template.agent_workflow_id = wf.id
                 session.commit()
 
 @app.on_event("startup")
 async def startup_event():
     logger.info("Running Startup tasks")
-    SessionLocal = sessionmaker(bind=engine)
+    run_migrations()
+
     session = SessionLocal()
-
-    def table_exists(table_name: str) -> bool:
-        try:
-            return engine.dialect.has_table(engine.connect(), table_name)
-        except Exception as e:
-            logger.error(f"Error checking table '{table_name}': {e}")
-            return False
-
     try:
-        run_migrations()
+        # Seed workflows (guarded by tables existing inside these helpers)
+        IterationWorkflowSeed.build_single_step_agent(session)
+        IterationWorkflowSeed.build_task_based_agents(session)
+        IterationWorkflowSeed.build_action_based_agents(session)
+        IterationWorkflowSeed.build_initialize_task_workflow(session)
 
-        if table_exists("users") and table_exists("organisations"):
-            default_user = session.query(User).filter(User.email == "super6@agi.com").first()
-            if default_user:
-                organisation = session.query(Organisation).filter_by(id=default_user.organisation_id).first()
-                if organisation:
-                    register_toolkits(session, organisation)
+        AgentWorkflowSeed.build_goal_based_agent(session)
+        AgentWorkflowSeed.build_task_based_agent(session)
+        AgentWorkflowSeed.build_fixed_task_based_agent(session)
+        AgentWorkflowSeed.build_sales_workflow(session)
+        AgentWorkflowSeed.build_recruitment_workflow(session)
+        AgentWorkflowSeed.build_coding_workflow(session)
 
-        if table_exists("agent_workflows"):
-            IterationWorkflowSeed.build_single_step_agent(session)
-            IterationWorkflowSeed.build_task_based_agents(session)
-            IterationWorkflowSeed.build_action_based_agents(session)
-            IterationWorkflowSeed.build_initialize_task_workflow(session)
+        # Clean up old workflow names
+        allowed = [
+            "Sales Engagement Workflow",
+            "Recruitment Workflow",
+            "SuperCoder",
+            "Goal Based Workflow",
+            "Dynamic Task Workflow",
+            "Fixed Task Workflow",
+        ]
+        for wf in session.query(AgentWorkflow).filter(AgentWorkflow.name.not_in(allowed)).all():
+            session.delete(wf)
 
-            AgentWorkflowSeed.build_goal_based_agent(session)
-            AgentWorkflowSeed.build_task_based_agent(session)
-            AgentWorkflowSeed.build_fixed_task_based_agent(session)
-            AgentWorkflowSeed.build_sales_workflow(session)
-            AgentWorkflowSeed.build_recruitment_workflow(session)
-            AgentWorkflowSeed.build_coding_workflow(session)
+        replace_old_iteration_workflows(session)
 
-            allowed = [
-                "Sales Engagement Workflow", "Recruitment Workflow", "SuperCoder",
-                "Goal Based Workflow", "Dynamic Task Workflow", "Fixed Task Workflow",
-            ]
-            extra = session.query(AgentWorkflow).filter(AgentWorkflow.name.not_in(allowed)).all()
-            for w in extra:
-                session.delete(w)
-
-            replace_old_iteration_workflows(session)
-
+        # Register toolkits
+        env = cfg("ENV", "DEV")
         if env != "PROD":
-            if table_exists("organisations"):
-                for org in session.query(Organisation).all():
-                    register_toolkits(session, org)
+            for org in session.query(Organisation).all():
+                register_toolkits(session, org)
+            logger.info("Successfully registered local toolkits for all Organisations!")
         else:
-            marketplace_org_id = get_config("MARKETPLACE_ORGANISATION_ID")
-            if marketplace_org_id and table_exists("organisations"):
-                org = session.query(Organisation).filter_by(id=marketplace_org_id).first()
-                if org:
-                    register_marketplace_toolkits(session, org)
+            marketplace_org_id = cfg("MARKETPLACE_ORGANISATION_ID")
+            if marketplace_org_id:
+                marketplace_org = session.query(Organisation).filter(
+                    Organisation.id == marketplace_org_id
+                ).first()
+                if marketplace_org:
+                    register_marketplace_toolkits(session, marketplace_org)
 
         session.commit()
-
     except Exception as e:
         logger.error(f"Startup event error: {e}")
-
     finally:
         session.close()
 
-# ------------------- JWT / Auth -------------------
+# =============================================================================
+# Routes
+# =============================================================================
 
-class Settings(BaseModel):
-    authjwt_secret_key: str = get_config("JWT_SECRET_KEY") or "CHANGE_ME_LOCAL_ONLY"
+@app.get("/")
+def root():
+    return {"message": "SuperAGI backend is running!"}
 
-@AuthJWT.load_config
-def get_config_jwt():
-    return Settings()
-
-@app.exception_handler(AuthJWTException)
-def authjwt_exception_handler(request: Request, exc: AuthJWTException):
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
-
-def create_access_token(email, Authorize: AuthJWT = Depends()):
-    expiry_raw = get_config("JWT_EXPIRY", 200)
-    try:
-        expiry_hours = int(expiry_raw) if expiry_raw is not None else 200
-    except Exception:
-        expiry_hours = 200
-    return Authorize.create_access_token(subject=email, expires_time=timedelta(hours=expiry_hours))
-
-# ------------------- Routes: Auth / Utility -------------------
+@app.get("/ping")
+def ping():
+    return {"message": "pong"}
 
 @app.post("/login")
 def login(request: LoginRequest, Authorize: AuthJWT = Depends()):
-    """
-    Email/password login -> returns JWT access token
-    """
-    try:
-        logger.info(f"🔐 /login called for email={request.email!r}")
-
-        jwt_secret = get_config("JWT_SECRET_KEY")
-        if not jwt_secret or not isinstance(jwt_secret, str) or not jwt_secret.strip():
-            logger.error("❌ JWT_SECRET_KEY is missing/blank in environment.")
-            raise HTTPException(status_code=500, detail="Server JWT misconfiguration. Set JWT_SECRET_KEY and redeploy.")
-
-        user = db.session.query(User).filter(User.email == request.email).first()
-        if user is None:
-            logger.warning("❌ /login: user not found")
-            raise HTTPException(status_code=401, detail="Bad username or password")
-
-        if request.password != user.password:
-            logger.warning("❌ /login: bad password")
-            raise HTTPException(status_code=401, detail="Bad username or password")
-
-        token = create_access_token(user.email, Authorize)
-        logger.info("✅ /login: token issued")
-        return {"access_token": token}
-
-    except AuthJWTException as e:
-        logger.exception(f"JWT error during /login: {e}")
-        raise HTTPException(status_code=500, detail="JWT subsystem error. Check JWT_SECRET_KEY.")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception(f"💥 /login crashed: {e}")
-        raise HTTPException(status_code=500, detail="Login crashed; check server logs.")
+    logger.info(f"🔐 /login called for email='{request.email}'")
+    if not JWT_SECRET:
+        # Hard fail if secret is missing
+        raise HTTPException(status_code=500, detail="Server JWT misconfiguration. Set JWT_SECRET_KEY and redeploy.")
+    user = db.session.query(User).filter(User.email == request.email).first()
+    if user is None or request.password != user.password:
+        raise HTTPException(status_code=401, detail="Bad username or password")
+    token = create_access_token(user.email, Authorize)
+    return {"access_token": token}
 
 @app.get("/user")
 def get_user(Authorize: AuthJWT = Depends()):
@@ -287,67 +287,13 @@ def validate_openai(open_ai_key: str):
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
-@app.get("/")
-def root():
-    return {"message": "SuperAGI backend is running!"}
-
-@app.get("/ping")
-def ping():
-    return {"message": "pong"}
-
-@app.get("/hello/{name}")
-def hello(name: str, Authorize: AuthJWT = Depends()):
-    Authorize.jwt_required()
-    return {"message": f"Hello {name}"}
-
 @app.get('/get/github_client_id')
 def github_client_id():
-    return {"github_client_id": (get_config("GITHUB_CLIENT_ID") or "").strip()}
+    return {"github_client_id": (cfg("GITHUB_CLIENT_ID", "") or "").strip()}
 
-# ------------------- OAuth (unchanged) -------------------
-
-@app.get('/github-login')
-def github_login():
-    github_client_id = ""
-    return RedirectResponse(f'https://github.com/login/oauth/authorize?scope=user:email&client_id={github_client_id}')
-
-@app.get('/github-auth')
-def github_auth_handler(code: str = Query(...), Authorize: AuthJWT = Depends()):
-    github_token_url = 'https://github.com/login/oauth/access_token'
-    github_client_id = get_config("GITHUB_CLIENT_ID")
-    github_client_secret = get_config("GITHUB_CLIENT_SECRET")
-    frontend_url = get_config("FRONTEND_URL", "http://localhost:3000")
-
-    params = {'client_id': github_client_id, 'client_secret': github_client_secret, 'code': code}
-    headers = {'Accept': 'application/json'}
-    response = requests.post(github_token_url, params=params, headers=headers)
-    if not response.ok:
-        return RedirectResponse(url="https://superagi.com/")
-
-    data = response.json()
-    access_token = data.get('access_token')
-    github_api_url = 'https://api.github.com/user'
-    headers = {'Authorization': f'Bearer {access_token}'}
-    response = requests.get(github_api_url, headers=headers)
-    if not response.ok:
-        return RedirectResponse(url="https://superagi.com/")
-
-    user_data = response.json()
-    user_email = user_data.get("email") or f"{user_data.get('login', 'user')}@github.com"
-    db_user: User = db.session.query(User).filter(User.email == user_email).first()
-    first_time = False
-    if db_user is None:
-        first_time = True
-        db_user = User(name=user_data.get("name") or "GitHub User", email=user_email)
-        db.session.add(db_user)
-        db.session.commit()
-
-    jwt_token = create_access_token(user_email, Authorize)
-    redirect_url_success = f"{frontend_url}?access_token={jwt_token}&first_time_login={str(first_time).lower()}"
-    return RedirectResponse(url=redirect_url_success)
-
-# ------------------- Include API Routers -------------------
-
+# =============================================================================
+# Include Routers
+# =============================================================================
 app.include_router(user_router, prefix="/users")
 app.include_router(tool_router, prefix="/tools")
 app.include_router(organisation_router, prefix="/organisations")
