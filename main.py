@@ -4,15 +4,16 @@ import requests
 from datetime import timedelta
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, status, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi_jwt_auth import AuthJWT
 from fastapi_jwt_auth.exceptions import AuthJWTException
 from fastapi_sqlalchemy import DBSessionMiddleware, db
 from pydantic import BaseModel
 from sqlalchemy.orm import sessionmaker
 
+import superagi
 from superagi.agent.workflow_seed import IterationWorkflowSeed, AgentWorkflowSeed
 from superagi.config.config import get_config
 from superagi.controllers.agent import router as agent_router
@@ -48,14 +49,14 @@ from superagi.lib.logger import logger
 from superagi.llms.llm_model_factory import build_model_with_api_key
 from superagi.llms.openai import OpenAi
 from superagi.models.agent_template import AgentTemplate
-from superagi.models.models_config import ModelsConfig
 from superagi.models.organisation import Organisation
 from superagi.models.types.login_request import LoginRequest
 from superagi.models.types.validate_llm_api_key_request import ValidateAPIKeyRequest
 from superagi.models.user import User
 from superagi.models.workflows.agent_workflow import AgentWorkflow
 from superagi.models.workflows.iteration_workflow import IterationWorkflow
-from superagi.models.db import connect_db
+
+# ------------------- FastAPI App -------------------
 
 app = FastAPI(
     title="SuperAGI",
@@ -66,27 +67,15 @@ app = FastAPI(
 
 # ------------------- Database Setup -------------------
 
-db_host = get_config('DB_HOST')
-db_url = get_config('DB_URL')
-db_username = get_config('DB_USERNAME')
-db_password = get_config('DB_PASSWORD')
-db_name = get_config('DB_NAME')
-env = get_config('ENV', "DEV")
-
-if db_url is None:
-    if db_username is None:
-        db_url = f'postgresql://{db_host}/{db_name}'
-    else:
-        db_url = f'postgresql://{db_username}:{db_password}@{db_host}/{db_name}'
-else:
-    db_url = urlparse(db_url)
-    db_url = db_url.scheme + "://" + db_url.netloc + db_url.path
-
+# We still read these, but connect_db() is the source of truth.
+from superagi.models.db import connect_db
 engine = connect_db()
-Session = sessionmaker(bind=engine)
-session = Session()
 
-app.add_middleware(DBSessionMiddleware, db_url=db_url)
+# IMPORTANT: Make FastAPI-SQLAlchemy middleware use the SAME URL as the working engine
+resolved_db_url = str(engine.url)
+app.add_middleware(DBSessionMiddleware, db_url=resolved_db_url)
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -94,11 +83,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ------------------- Run Alembic Migrations -------------------
+# ------------------- Alembic Migrations -------------------
 
 def run_migrations():
     try:
-        logger.info("\ud83d\udd27 Running Alembic migrations...")
+        logger.info("🔧 Running Alembic migrations...")
         subprocess.run(
             ["alembic", "upgrade", "head"],
             check=True,
@@ -107,7 +96,7 @@ def run_migrations():
             text=True
         )
     except subprocess.CalledProcessError as e:
-        logger.error("\u26a0\ufe0f Alembic migration failed:")
+        logger.error("⚠️ Alembic migration failed:")
         logger.error(e.stderr)
 
 # ------------------- Startup Event -------------------
@@ -126,12 +115,15 @@ def replace_old_iteration_workflows(session):
         }
         if iter_workflow.name in name_map:
             agent_workflow = AgentWorkflow.find_by_name(session, name_map[iter_workflow.name])
-            template.agent_workflow_id = agent_workflow.id
-            session.commit()
+            if agent_workflow:
+                template.agent_workflow_id = agent_workflow.id
+                session.commit()
 
 @app.on_event("startup")
 async def startup_event():
     logger.info("Running Startup tasks")
+
+    Session = sessionmaker(bind=engine)
     session = Session()
 
     def table_exists(table_name: str) -> bool:
@@ -164,26 +156,27 @@ async def startup_event():
             AgentWorkflowSeed.build_recruitment_workflow(session)
             AgentWorkflowSeed.build_coding_workflow(session)
 
-            allowed_workflows = [
+            allowed = [
                 "Sales Engagement Workflow", "Recruitment Workflow", "SuperCoder",
                 "Goal Based Workflow", "Dynamic Task Workflow", "Fixed Task Workflow"
             ]
             workflows_to_remove = session.query(AgentWorkflow).filter(
-                AgentWorkflow.name.not_in(allowed_workflows)).all()
-            for workflow in workflows_to_remove:
-                session.delete(workflow)
+                AgentWorkflow.name.not_in(allowed)).all()
+            for wf in workflows_to_remove:
+                session.delete(wf)
 
             replace_old_iteration_workflows(session)
 
+        env = get_config('ENV', "DEV")
         if env != "PROD":
             if table_exists("organisations"):
-                organizations = session.query(Organisation).all()
-                for org in organizations:
+                orgs = session.query(Organisation).all()
+                for org in orgs:
                     register_toolkits(session, org)
         else:
-            marketplace_organisation_id = get_config("MARKETPLACE_ORGANISATION_ID")
-            if marketplace_organisation_id and table_exists("organisations"):
-                org = session.query(Organisation).filter_by(id=marketplace_organisation_id).first()
+            marketplace_org_id = get_config("MARKETPLACE_ORGANISATION_ID")
+            if marketplace_org_id and table_exists("organisations"):
+                org = session.query(Organisation).filter_by(id=marketplace_org_id).first()
                 if org:
                     register_marketplace_toolkits(session, org)
 
@@ -200,7 +193,7 @@ class Settings(BaseModel):
     authjwt_secret_key: str = get_config("JWT_SECRET_KEY")
 
 @AuthJWT.load_config
-def get_config_jwt():
+def _jwt_config():
     return Settings()
 
 @app.exception_handler(AuthJWTException)
@@ -208,8 +201,8 @@ def authjwt_exception_handler(request: Request, exc: AuthJWTException):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
 def create_access_token(email, Authorize: AuthJWT = Depends()):
-    expiry = int(get_config("JWT_EXPIRY", 200))
-    return Authorize.create_access_token(subject=email, expires_time=timedelta(hours=expiry))
+    expiry_hours = int(get_config("JWT_EXPIRY", 200))
+    return Authorize.create_access_token(subject=email, expires_time=timedelta(hours=expiry_hours))
 
 @app.post("/login")
 def login(request: LoginRequest, Authorize: AuthJWT = Depends()):
@@ -227,8 +220,8 @@ def get_user(Authorize: AuthJWT = Depends()):
 def validate_token(Authorize: AuthJWT = Depends()):
     try:
         Authorize.jwt_required()
-        user_email = Authorize.get_jwt_subject()
-        return db.session.query(User).filter(User.email == user_email).first()
+        email = Authorize.get_jwt_subject()
+        return db.session.query(User).filter(User.email == email).first()
     except:
         raise HTTPException(status_code=401, detail="Invalid token")
 
@@ -262,11 +255,14 @@ def hello(name: str, Authorize: AuthJWT = Depends()):
     Authorize.jwt_required()
     return {"message": f"Hello {name}"}
 
-@app.get('/get/github_client_id')
+@app.get("/get/github_client_id")
 def github_client_id():
-    return {"github_client_id": get_config("GITHUB_CLIENT_ID", "").strip()}
+    val = get_config("GITHUB_CLIENT_ID", "")
+    if val:
+        val = val.strip()
+    return {"github_client_id": val}
 
-# ------------------- Include Routers -------------------
+# ------------------- Include API Routers -------------------
 
 app.include_router(user_router, prefix="/users")
 app.include_router(tool_router, prefix="/tools")
@@ -296,8 +292,3 @@ app.include_router(marketplace_stats_router, prefix="/marketplace")
 app.include_router(api_key_router, prefix="/api-keys")
 app.include_router(api_agent_router, prefix="/v1/agent")
 app.include_router(web_hook_router, prefix="/webhook")
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
