@@ -8,7 +8,7 @@ from superagi.models.organisation import Organisation
 from superagi.models.project import Project
 from superagi.models.user import User
 from superagi.models.models_config import ModelsConfig
-from superagi.models.db import session  # ✅ Always use the global session
+from fastapi_sqlalchemy import db  # ✅ correct import for session
 from superagi.helper.auth import get_current_user
 from superagi.lib.logger import logger
 
@@ -16,7 +16,7 @@ router = APIRouter()
 
 # ========= AUTH HELPER =========
 API_KEY_NAME = "X-API-Key"
-EXPECTED_API_KEY = "superagi"  # Change this if you want
+EXPECTED_API_KEY = "superagi"  # Change if you want
 
 def verify_api_key(x_api_key: str = Header(...)):
     logger.info(f"🔑 Expected API Key for {API_KEY_NAME} header: '{EXPECTED_API_KEY}'")
@@ -59,7 +59,7 @@ def create_user(user: UserIn):
         logger.error("❌ Missing required fields: name, email, or password")
         raise HTTPException(status_code=422, detail="Missing required fields: name, email, or password")
 
-    db_user = session.query(User).filter(User.email == user.email).first()
+    db_user = db.session.query(User).filter(User.email == user.email).first()
     if db_user:
         logger.warning("⚠️ User already exists, returning existing user.")
         return db_user
@@ -70,29 +70,29 @@ def create_user(user: UserIn):
         password=user.password,
         organisation_id=user.organisation_id
     )
-    session.add(db_user)
-    session.commit()
-    session.refresh(db_user)
+    db.session.add(db_user)
+    db.session.commit()
+    db.session.refresh(db_user)
 
-    organisation = Organisation.find_or_create_organisation(session, db_user)
-    Project.find_or_create_default_project(session, organisation.id)
+    organisation = Organisation.find_or_create_organisation(db.session, db_user)
+    Project.find_or_create_default_project(db.session, organisation.id)
     logger.info(f"✅ User created: {db_user}")
 
     # Add default model config
-    ModelsConfig.add_llm_config(session, organisation.id)
+    ModelsConfig.add_llm_config(db.session, organisation.id)
 
     return db_user
 
 @router.get("/get/{user_id}", response_model=UserOut, dependencies=[Depends(verify_api_key)])
 def get_user(user_id: int):
-    db_user = session.query(User).filter(User.id == user_id).first()
+    db_user = db.session.query(User).filter(User.id == user_id).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
     return db_user
 
 @router.put("/update/{user_id}", response_model=UserOut, dependencies=[Depends(verify_api_key)])
 def update_user(user_id: int, user: UserBase):
-    db_user = session.query(User).filter(User.id == user_id).first()
+    db_user = db.session.query(User).filter(User.id == user_id).first()
     if not db_user:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -100,7 +100,7 @@ def update_user(user_id: int, user: UserBase):
     db_user.email = user.email
     db_user.password = user.password
 
-    session.commit()
+    db.session.commit()
     return db_user
 
 @router.post("/first_login_source/{source}", dependencies=[Depends(verify_api_key)])
@@ -108,6 +108,6 @@ def update_first_login_source(source: str):
     user = get_current_user()
     if user.first_login_source is None or user.first_login_source == '':
         user.first_login_source = source
-    session.commit()
+    db.session.commit()
     logger.info(f"🔄 Updated first login source for user {user.id} to {source}")
     return user
