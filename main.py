@@ -1,9 +1,9 @@
 import os
 import subprocess
-import requests
 from datetime import timedelta
 from urllib.parse import urlparse
 
+import requests
 from fastapi import FastAPI, HTTPException, Depends, Request, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -55,6 +55,7 @@ from superagi.models.types.validate_llm_api_key_request import ValidateAPIKeyReq
 from superagi.models.user import User
 from superagi.models.workflows.agent_workflow import AgentWorkflow
 from superagi.models.workflows.iteration_workflow import IterationWorkflow
+from superagi.models.db import connect_db
 
 # ------------------- FastAPI App -------------------
 
@@ -65,14 +66,32 @@ app = FastAPI(
     openapi_url="/openapi.json"
 )
 
-# ------------------- Database Setup -------------------
+# ------------------- Database & Middleware -------------------
 
-# We still read these, but connect_db() is the source of truth.
-from superagi.models.db import connect_db
+# Pull config; keep db_url for middleware
+db_host = get_config('DB_HOST')
+db_url = get_config('DB_URL')
+db_username = get_config('DB_USERNAME')
+db_password = get_config('DB_PASSWORD')
+db_name = get_config('DB_NAME')
+env = get_config('ENV', "DEV")
+
+if db_url is None:
+    if db_username is None:
+        db_url = f'postgresql://{db_host}/{db_name}'
+    else:
+        db_url = f'postgresql://{db_username}:{db_password}@{db_host}/{db_name}'
+else:
+    parsed = urlparse(db_url)
+    db_url = parsed.scheme + "://" + parsed.netloc + parsed.path
+
+# Create engine via project helper
 engine = connect_db()
+Session = sessionmaker(bind=engine)
 
-# IMPORTANT: Make FastAPI-SQLAlchemy middleware use the SAME URL as the working engine
-resolved_db_url = str(engine.url)
+# IMPORTANT: SQLAlchemy hides passwords when str(engine.url) is used.
+# Use render_as_string(hide_password=False) so the middleware can connect.
+resolved_db_url = engine.url.render_as_string(hide_password=False)
 app.add_middleware(DBSessionMiddleware, db_url=resolved_db_url)
 
 # CORS
@@ -99,22 +118,23 @@ def run_migrations():
         logger.error("⚠️ Alembic migration failed:")
         logger.error(e.stderr)
 
-# ------------------- Startup Event -------------------
+# ------------------- Startup Seeding -------------------
 
 def replace_old_iteration_workflows(session):
     templates = session.query(AgentTemplate).all()
+    name_map = {
+        "Fixed Task Queue": "Fixed Task Workflow",
+        "Maintain Task Queue": "Dynamic Task Workflow",
+        "Don't Maintain Task Queue": "Goal Based Workflow",
+        "Goal Based Agent": "Goal Based Workflow",
+    }
     for template in templates:
-        iter_workflow = IterationWorkflow.find_by_id(session, template.agent_workflow_id)
-        if not iter_workflow:
+        iter_wf = IterationWorkflow.find_by_id(session, template.agent_workflow_id)
+        if not iter_wf:
             continue
-        name_map = {
-            "Fixed Task Queue": "Fixed Task Workflow",
-            "Maintain Task Queue": "Dynamic Task Workflow",
-            "Don't Maintain Task Queue": "Goal Based Workflow",
-            "Goal Based Agent": "Goal Based Workflow",
-        }
-        if iter_workflow.name in name_map:
-            agent_workflow = AgentWorkflow.find_by_name(session, name_map[iter_workflow.name])
+        new_name = name_map.get(iter_wf.name)
+        if new_name:
+            agent_workflow = AgentWorkflow.find_by_name(session, new_name)
             if agent_workflow:
                 template.agent_workflow_id = agent_workflow.id
                 session.commit()
@@ -122,20 +142,22 @@ def replace_old_iteration_workflows(session):
 @app.on_event("startup")
 async def startup_event():
     logger.info("Running Startup tasks")
-
-    Session = sessionmaker(bind=engine)
     session = Session()
 
     def table_exists(table_name: str) -> bool:
         try:
-            return engine.dialect.has_table(engine.connect(), table_name)
+            # Use SQLAlchemy dialect helper to check
+            with engine.connect() as conn:
+                return engine.dialect.has_table(conn, table_name)
         except Exception as e:
             logger.error(f"Error checking table '{table_name}': {e}")
             return False
 
     try:
+        # Run migrations first so tables exist
         run_migrations()
 
+        # Register toolkits for an existing default user (optional)
         if table_exists("users") and table_exists("organisations"):
             default_user = session.query(User).filter(User.email == "super6@agi.com").first()
             if default_user:
@@ -143,6 +165,7 @@ async def startup_event():
                 if organisation:
                     register_toolkits(session, organisation)
 
+        # Seed workflows if table exists
         if table_exists("agent_workflows"):
             IterationWorkflowSeed.build_single_step_agent(session)
             IterationWorkflowSeed.build_task_based_agents(session)
@@ -156,44 +179,46 @@ async def startup_event():
             AgentWorkflowSeed.build_recruitment_workflow(session)
             AgentWorkflowSeed.build_coding_workflow(session)
 
-            allowed = [
+            # Clean up unknown workflows
+            allowed = {
                 "Sales Engagement Workflow", "Recruitment Workflow", "SuperCoder",
                 "Goal Based Workflow", "Dynamic Task Workflow", "Fixed Task Workflow"
-            ]
+            }
             workflows_to_remove = session.query(AgentWorkflow).filter(
-                AgentWorkflow.name.not_in(allowed)).all()
+                AgentWorkflow.name.not_in(list(allowed))
+            ).all()
             for wf in workflows_to_remove:
                 session.delete(wf)
 
             replace_old_iteration_workflows(session)
 
-        env = get_config('ENV', "DEV")
+        # Toolkit registration strategy
         if env != "PROD":
             if table_exists("organisations"):
-                orgs = session.query(Organisation).all()
-                for org in orgs:
+                organizations = session.query(Organisation).all()
+                for org in organizations:
                     register_toolkits(session, org)
         else:
-            marketplace_org_id = get_config("MARKETPLACE_ORGANISATION_ID")
-            if marketplace_org_id and table_exists("organisations"):
-                org = session.query(Organisation).filter_by(id=marketplace_org_id).first()
-                if org:
-                    register_marketplace_toolkits(session, org)
+            if table_exists("organisations"):
+                marketplace_org_id = get_config("MARKETPLACE_ORGANISATION_ID")
+                if marketplace_org_id:
+                    org = session.query(Organisation).filter_by(id=marketplace_org_id).first()
+                    if org:
+                        register_marketplace_toolkits(session, org)
 
         session.commit()
-
     except Exception as e:
         logger.error(f"Startup event error: {e}")
     finally:
         session.close()
 
-# ------------------- Auth + Routes -------------------
+# ------------------- Auth & Small APIs -------------------
 
 class Settings(BaseModel):
     authjwt_secret_key: str = get_config("JWT_SECRET_KEY")
 
 @AuthJWT.load_config
-def _jwt_config():
+def get_config_jwt():
     return Settings()
 
 @app.exception_handler(AuthJWTException)
@@ -201,8 +226,8 @@ def authjwt_exception_handler(request: Request, exc: AuthJWTException):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
 def create_access_token(email, Authorize: AuthJWT = Depends()):
-    expiry_hours = int(get_config("JWT_EXPIRY", 200))
-    return Authorize.create_access_token(subject=email, expires_time=timedelta(hours=expiry_hours))
+    expiry = int(get_config("JWT_EXPIRY", 200))
+    return Authorize.create_access_token(subject=email, expires_time=timedelta(hours=expiry))
 
 @app.post("/login")
 def login(request: LoginRequest, Authorize: AuthJWT = Depends()):
@@ -220,8 +245,8 @@ def get_user(Authorize: AuthJWT = Depends()):
 def validate_token(Authorize: AuthJWT = Depends()):
     try:
         Authorize.jwt_required()
-        email = Authorize.get_jwt_subject()
-        return db.session.query(User).filter(User.email == email).first()
+        user_email = Authorize.get_jwt_subject()
+        return db.session.query(User).filter(User.email == user_email).first()
     except:
         raise HTTPException(status_code=401, detail="Invalid token")
 
@@ -240,7 +265,7 @@ def validate_openai(open_ai_key: str):
     except:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
-# ------------------- Utility Routes -------------------
+# ------------------- Utility & Health -------------------
 
 @app.get("/")
 def root():
@@ -255,14 +280,11 @@ def hello(name: str, Authorize: AuthJWT = Depends()):
     Authorize.jwt_required()
     return {"message": f"Hello {name}"}
 
-@app.get("/get/github_client_id")
+@app.get('/get/github_client_id')
 def github_client_id():
-    val = get_config("GITHUB_CLIENT_ID", "")
-    if val:
-        val = val.strip()
-    return {"github_client_id": val}
+    return {"github_client_id": (get_config("GITHUB_CLIENT_ID") or "").strip()}
 
-# ------------------- Include API Routers -------------------
+# ------------------- Routers -------------------
 
 app.include_router(user_router, prefix="/users")
 app.include_router(tool_router, prefix="/tools")
